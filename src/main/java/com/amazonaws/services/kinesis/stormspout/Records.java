@@ -18,6 +18,10 @@ package com.amazonaws.services.kinesis.stormspout;
 import com.amazonaws.services.kinesis.model.Record;
 import com.google.common.collect.ImmutableList;
 
+import java.util.Iterator;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
 /**
  * Used to hold a set of records and indicate if we reached the end of a shard.
  * Used in IShardGetter.getNext(n).
@@ -25,6 +29,7 @@ import com.google.common.collect.ImmutableList;
 class Records {
     private final ImmutableList<Record> records;
     private final boolean endOfShard;
+    private final Iterator<Record> iterator;
 
     /**
      * Constructor.
@@ -35,6 +40,7 @@ class Records {
     Records(final ImmutableList<Record> records, final boolean endOfShard) {
         this.records = records;
         this.endOfShard = endOfShard;
+        this.iterator = records.iterator();
     }
 
     /**
@@ -59,6 +65,10 @@ class Records {
         return records;
     }
 
+    void addAll(ConcurrentLinkedQueue<Record> records) {
+        records.addAll(records);
+    }
+
     /**
      * @return true if we reached the end of a shard.
      */
@@ -73,5 +83,18 @@ class Records {
      */
     boolean isEmpty() {
         return records.isEmpty();
+    }
+
+    /**
+     * Get the next record in the list (if any)
+     *
+     * @return record object if one exists that has not yet been iterated on
+     */
+    public Optional<Record> getNext() {
+        if (iterator.hasNext()) {
+            return Optional.of(iterator.next());
+        }
+
+        return Optional.empty();
     }
 }

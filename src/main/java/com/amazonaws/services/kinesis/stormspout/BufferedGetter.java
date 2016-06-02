@@ -15,28 +15,50 @@
 
 package com.amazonaws.services.kinesis.stormspout;
 
-import java.util.Iterator;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
+import com.google.common.collect.ImmutableList;
 import org.apache.commons.lang3.builder.ToStringBuilder;
 import org.apache.commons.lang3.builder.ToStringStyle;
 
 import com.amazonaws.services.kinesis.model.Record;
 import com.amazonaws.services.kinesis.stormspout.exceptions.InvalidSeekPositionException;
-import com.google.common.collect.ImmutableList;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Allows users to do efficient getter.getNext(1) calls in exchange for maybe pulling
  * more data than necessary from Kinesis.
  */
 class BufferedGetter implements IShardGetter {
+    private static final Logger LOG = LoggerFactory.getLogger(BufferedGetter.class);
     private final IShardGetter getter;
     private final int maxBufferSize;
     private final long emptyRecordListBackoffTime;
+    private final long topUpRecordListBackoffTime;
+    private final long topUpRecordListThreshold;
     private long nextRebufferTime = 0L;
     private final TimeProvider timeProvider;
 
-    private Records buffer;
-    private Iterator<Record> it;
+    /**
+     * This buffer uses a concurrent queue to handle background prefetch
+     * while current contents can be iterated on. The main thread will only
+     * access items at the front of the queue, while the background task fetching
+     * new records will only append new record lists to the back.
+     * isEndOfShard and bufferSize are atomic types and hold whether we've reached
+     * the end of the shard and the number of records remaining in the buffer,
+     * respectively.
+     */
+    private ConcurrentLinkedQueue<Records> buffer;
+    private AtomicBoolean isEndOfShard;
+    private AtomicInteger bufferSize;
+
+    private ExecutorService taskPool;
 
     /**
      * Creates a (shard) getter that buffers records.
@@ -45,8 +67,17 @@ class BufferedGetter implements IShardGetter {
      * @param maxBufferSize Max number of records to fetch from the underlying getter.
      * @param emptyRecordListBackoffMillis Backoff time between GetRecords calls if previous call fetched no records.
      */
-    public BufferedGetter(final IShardGetter underlyingGetter, final int maxBufferSize, final long emptyRecordListBackoffMillis) {
-        this(underlyingGetter, maxBufferSize, emptyRecordListBackoffMillis, new TimeProvider());
+    public BufferedGetter(final IShardGetter underlyingGetter,
+                          final int maxBufferSize,
+                          final long emptyRecordListBackoffMillis,
+                          final long topUpRecordListBackoffMillis,
+                          final long topUpRecordListThreshold) {
+        this(underlyingGetter,
+                maxBufferSize,
+                emptyRecordListBackoffMillis,
+                topUpRecordListBackoffMillis,
+                topUpRecordListThreshold,
+                new TimeProvider());
     }
     
     /**
@@ -60,36 +91,45 @@ class BufferedGetter implements IShardGetter {
     BufferedGetter(final IShardGetter underlyingGetter,
             final int maxBufferSize,
             final long emptyRecordListBackoffMillis,
+            final long topUpRecordListBackoffMillis,
+            final long topUpRecordListThreshold,
             final TimeProvider timeProvider) {
         this.getter = underlyingGetter;
         this.maxBufferSize = maxBufferSize;
         this.emptyRecordListBackoffTime = emptyRecordListBackoffMillis;
+        this.topUpRecordListBackoffTime = topUpRecordListBackoffMillis;
+        this.topUpRecordListThreshold = topUpRecordListThreshold;
         this.timeProvider = timeProvider;
+        this.isEndOfShard = new AtomicBoolean(false);
+        this.taskPool = Executors.newSingleThreadExecutor();
+        this.buffer = new ConcurrentLinkedQueue<>();
+        this.bufferSize = new AtomicInteger(0);
     }
 
     @Override
     public Records getNext(int maxNumberOfRecords) {
         ensureBuffered();
 
-        if (!it.hasNext() && buffer.isEndOfShard()) {
-            return new Records(ImmutableList.<Record> of(), true);
+        if (buffer.isEmpty() && isEndOfShard.get()) {
+            return new Records(ImmutableList.of(), true);
         }
 
         ImmutableList.Builder<Record> recs = new ImmutableList.Builder<>();
         int recsSize = 0;
 
         while (recsSize < maxNumberOfRecords) {
-            if (it.hasNext()) {
-                recs.add(it.next());
-                recsSize++;
-            } else if (!it.hasNext() && !buffer.isEndOfShard()) {
-                rebuffer();
-                // No more data in shard.
-                if (!it.hasNext()) {
-                    break;
+            if ((buffer != null) && !buffer.isEmpty()) {
+                Optional<Record> record = buffer.peek().getNext();
+                if (record.isPresent()) {
+                    bufferSize.decrementAndGet();
+                    recs.add(record.get());
+                    recsSize++;
+                } else {
+                    // this Records iterator has exhausted the list
+                    buffer.remove();
                 }
             } else {
-                // No more records, end of shard.
+                // No more records
                 break;
             }
         }
@@ -100,8 +140,8 @@ class BufferedGetter implements IShardGetter {
     @Override
     public void seek(ShardPosition position) throws InvalidSeekPositionException {
         getter.seek(position);
-        buffer = null;
-        it = null;
+        buffer.clear();
+        bufferSize.set(0);
     }
 
     @Override
@@ -116,23 +156,39 @@ class BufferedGetter implements IShardGetter {
     }
 
     private void ensureBuffered() {
-        if (buffer == null || it == null) {
-            rebuffer();
+        if (   buffer.isEmpty()
+            || (   (bufferSize.get() < topUpRecordListThreshold)
+                && (timeProvider.getCurrentTimeMillis() >= nextRebufferTime))) {
+
+            taskPool.execute(this::rebuffer);
         }
     }
 
-    // Post : buffer != null && it != null
     private void rebuffer() {
-        if ((buffer == null) || (it == null) || (timeProvider.getCurrentTimeMillis() >= nextRebufferTime)) {
-            buffer = getter.getNext(maxBufferSize);
-            it = buffer.getRecords().iterator();
+        if (   buffer.isEmpty()
+            || (   (bufferSize.get() < topUpRecordListThreshold)
+                && (timeProvider.getCurrentTimeMillis() >= nextRebufferTime))) {
+
+            nextRebufferTime = timeProvider.getCurrentTimeMillis() + topUpRecordListBackoffTime;
+
+            try {
+                Records records = getter.getNext(maxBufferSize);
+                if (!records.isEmpty()) {
+                    buffer.add(records);
+                    bufferSize.getAndAdd(records.getRecords().size());
+                }
+                isEndOfShard.set(records.isEndOfShard());
+            } catch (IllegalArgumentException e) {
+                LOG.debug("[" + getAssociatedShard() + "] Exception caught: ", e);
+            }
+
             // Backoff if we get an empty record list
             if (buffer.isEmpty()) {
                 nextRebufferTime = timeProvider.getCurrentTimeMillis() + emptyRecordListBackoffTime;
             }
         }
     }
-    
+
     /** 
      * Time provider - helpful for unit tests of BufferedGetter.
      */

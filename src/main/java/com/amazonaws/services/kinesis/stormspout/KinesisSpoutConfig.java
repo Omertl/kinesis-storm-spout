@@ -32,6 +32,9 @@ public class KinesisSpoutConfig implements Serializable {
     private int checkpointIntervalMillis = 60000;
     // Backoff time between Kinesis GetRecords API calls (per shard) when a call returns an empty list of records.
     private long emptyRecordListBackoffMillis = 500L;
+    // Backoff time between Kinesis GetRecords API calls (per shard) for topping up the buffer
+    private long topUpRecordListBackoffMillis = 200L;
+    private long topUpRecordListThreshold = 1000L;
     private int recordRetryLimit = 3;
     private Regions region = Regions.US_EAST_1;
 
@@ -264,7 +267,15 @@ public class KinesisSpoutConfig implements Serializable {
     public long getEmptyRecordListBackoffMillis() {
         return emptyRecordListBackoffMillis ;
     }
-    
+
+    public long getTopUpRecordListBackoffMillis() {
+        return topUpRecordListBackoffMillis ;
+    }
+
+    public long getTopUpRecordListThreshold() {
+        return topUpRecordListThreshold ;
+    }
+
     /**
      * @param emptyRecordListBackoffMillis Backoff for this time before making the next Kinesis GetRecords API call (per
      *        shard) if the previous call returned no records.
@@ -272,6 +283,26 @@ public class KinesisSpoutConfig implements Serializable {
      */
     public KinesisSpoutConfig withEmptyRecordListBackoffMillis(long emptyRecordListBackoffMillis) {
         this.emptyRecordListBackoffMillis = emptyRecordListBackoffMillis;
+        return this;
+    }
+
+    /**
+     * @param topUpRecordListBackoffMillis Backoff for this time before making the next Kinesis GetRecords API call (per
+     *        shard) for the purposes of topping up the buffer when it's not empty.
+     * @return KinesisSpoutConfig
+     */
+    public KinesisSpoutConfig withTopUpRecordListBackoffMillis(long topUpRecordListBackoffMillis) {
+        this.topUpRecordListBackoffMillis = topUpRecordListBackoffMillis;
+        return this;
+    }
+
+    /**
+     * @param topUpRecordListThreshold Minimum number of records left in the queue to trigger a preemptive fetch for
+     *        additional records, if topUpRecordListBackoffMillis has passed since last fetch.
+     * @return KinesisSpoutConfig
+     */
+    public KinesisSpoutConfig withTopUpRecordListThreshold(long topUpRecordListThreshold) {
+        this.topUpRecordListThreshold = topUpRecordListThreshold;
         return this;
     }
 }

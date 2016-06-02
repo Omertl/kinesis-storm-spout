@@ -25,6 +25,8 @@ class KinesisShardGetterBuilder implements IShardGetterBuilder {
 
     private final int maxRecordsPerCall;
     private final long emptyRecordListBackoffMillis;
+    private final long topUpRecordListBackoffMillis;
+    private final long topUpRecordListThreshold;
 
     private final String streamName;
     private final KinesisHelper helper;
@@ -38,11 +40,15 @@ class KinesisShardGetterBuilder implements IShardGetterBuilder {
     public KinesisShardGetterBuilder(final String streamName,
             final KinesisHelper helper,
             final int maxRecordsPerCall,
-            final long emptyRecordListBackoffMillis) {
+            final long emptyRecordListBackoffMillis,
+            final long topUpRecordListBackoffMillis,
+            final long topUpRecordListThreshold) {
         this.streamName = streamName;
         this.helper = helper;
         this.maxRecordsPerCall = maxRecordsPerCall;
         this.emptyRecordListBackoffMillis = emptyRecordListBackoffMillis;
+        this.topUpRecordListBackoffMillis = topUpRecordListBackoffMillis;
+        this.topUpRecordListThreshold = topUpRecordListThreshold;
     }
 
     @Override
@@ -52,7 +58,9 @@ class KinesisShardGetterBuilder implements IShardGetterBuilder {
         for (String shard : shardAssignment) {
             builder.add(new BufferedGetter(new KinesisShardGetter(streamName, shard, helper.getSharedkinesisClient()),
                     maxRecordsPerCall,
-                    emptyRecordListBackoffMillis));
+                    emptyRecordListBackoffMillis,
+                    topUpRecordListBackoffMillis,
+                    topUpRecordListThreshold));
         }
 
         return builder.build();

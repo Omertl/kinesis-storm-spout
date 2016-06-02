@@ -19,6 +19,7 @@ import java.io.Serializable;
 import java.util.List;
 import java.util.Map;
 
+import com.google.common.collect.ImmutableList;
 import org.apache.commons.lang3.builder.ToStringBuilder;
 import org.apache.commons.lang3.builder.ToStringStyle;
 import org.slf4j.Logger;
@@ -35,7 +36,6 @@ import com.amazonaws.auth.AWSCredentialsProvider;
 import com.amazonaws.services.kinesis.model.Record;
 import com.amazonaws.services.kinesis.stormspout.state.IKinesisSpoutStateManager;
 import com.amazonaws.services.kinesis.stormspout.state.zookeeper.ZookeeperStateManager;
-import com.google.common.collect.ImmutableList;
 
 /**
  * Storm spout for Amazon Kinesis. The spout fetches data from Kinesis and emits a tuple for each data record.
@@ -82,7 +82,9 @@ public class KinesisSpout implements IRichSpout, Serializable {
                 new KinesisShardGetterBuilder(config.getStreamName(),
                         helper,
                         config.getMaxRecordsPerCall(),
-                        config.getEmptyRecordListBackoffMillis());
+                        config.getEmptyRecordListBackoffMillis(),
+                        config.getTopUpRecordListBackoffMillis(),
+                        config.getTopUpRecordListThreshold());
         this.initialPosition = config.getInitialPositionInStream();
     }
 
