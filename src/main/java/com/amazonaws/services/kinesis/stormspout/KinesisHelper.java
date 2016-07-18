@@ -15,6 +15,8 @@
 
 package com.amazonaws.services.kinesis.stormspout;
 
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -32,6 +34,10 @@ import com.amazonaws.regions.Regions;
 import com.amazonaws.services.kinesis.AmazonKinesisClient;
 import com.amazonaws.services.kinesis.model.DescribeStreamRequest;
 import com.amazonaws.services.kinesis.model.DescribeStreamResult;
+import com.amazonaws.services.kinesis.model.PutRecordsRequest;
+import com.amazonaws.services.kinesis.model.PutRecordsRequestEntry;
+import com.amazonaws.services.kinesis.model.PutRecordsResult;
+import com.amazonaws.services.kinesis.model.PutRecordsResultEntry;
 import com.amazonaws.services.kinesis.model.Shard;
 import com.amazonaws.services.kinesis.stormspout.utils.InfiniteConstantBackoffRetry;
 import com.amazonaws.services.kinesis.stormspout.utils.ShardIdComparator;
@@ -52,11 +58,14 @@ class KinesisHelper implements IShardListGetter {
     private final byte[] serializedkinesisClientConfig;
     private final byte[] serializedRegion;
     private final String streamName;
-
+    private List<PutRecordsRequestEntry> putRecordsRequestEntryList;
+    
     private transient AWSCredentialsProvider kinesisCredsProvider;
     private transient ClientConfiguration kinesisClientConfig;
     private transient AmazonKinesisClient kinesisClient;
     private transient Region region;
+    
+    private long lastPutRecord = 0;
 
     /**
      * @param streamName Kinesis stream name to interact with.
@@ -71,11 +80,11 @@ class KinesisHelper implements IShardListGetter {
         this.serializedKinesisCredsProvider = SerializationHelper.kryoSerializeObject(kinesisCredsProvider);
         this.serializedkinesisClientConfig = SerializationHelper.kryoSerializeObject(kinesisClientConfig);
         this.serializedRegion = SerializationHelper.kryoSerializeObject(region);
-
         this.kinesisCredsProvider = null;
         this.kinesisClientConfig = null;
         this.region = null;
         this.kinesisClient = null;
+        putRecordsRequestEntryList = new ArrayList<PutRecordsRequestEntry>();
     }
 
     @Override
@@ -186,5 +195,64 @@ class KinesisHelper implements IShardListGetter {
         }
 
         return currShard;
+    }
+    
+    /** 
+     * Puts a new record into the kinesis stream
+     * @param partitionkey
+     * @param record
+     */
+    public void putRecords(String partitionkey,String record)
+    {
+    	// Create the entry request
+    	PutRecordsRequestEntry putRecordsRequestEntry = new PutRecordsRequestEntry();
+    	ByteBuffer data = ByteBuffer.wrap(record.getBytes());
+    	putRecordsRequestEntry.setData(data);
+    	putRecordsRequestEntry.setPartitionKey(partitionkey);
+    	// Add to the recordsRequestEntryList
+    	putRecordsRequestEntryList.add(putRecordsRequestEntry);
+    	LOG.debug(this + " adding to retry queue " + partitionkey);
+    	// Check the interval since we last inserted back to kinesis
+    	long interval = System.currentTimeMillis() - this.lastPutRecord;
+    	// If the list is bigger then 500 or more then 5 minutes passed without putrecords then insert to kinesis
+    	if (putRecordsRequestEntryList.size()==500 || ((interval > 300*1000) && putRecordsRequestEntryList.size()>0))
+    	{
+    		PutRecordsRequest putRecordsRequest = new PutRecordsRequest();
+    		putRecordsRequest.setStreamName(streamName);
+    		putRecordsRequest.setRecords(putRecordsRequestEntryList);
+    		// Put the records into kinesis and get the result
+            LOG.debug(this + " putting back into kinesis " + partitionkey);
+    		PutRecordsResult  result = kinesisClient.putRecords(putRecordsRequest);
+    		// Handling errors
+        	while (result.getFailedRecordCount()>0)
+        	{
+        		LOG.debug(this + " got failed records " + result.getFailedRecordCount());
+        		final List<PutRecordsRequestEntry> failedRecordsList = new ArrayList<>();
+        		final List<PutRecordsResultEntry> putRecordsResultEntryList = result.getRecords();
+        		// Search in all the records entered to kinesis which were failed
+        		for (int i = 0; i < putRecordsResultEntryList.size(); i++) {
+        			final PutRecordsRequestEntry putRecordRequestEntry = putRecordsRequestEntryList.get(i);
+        			final PutRecordsResultEntry putRecordsResultEntry = putRecordsResultEntryList.get(i);
+        			if (putRecordsResultEntry.getErrorCode() != null)
+        			{
+        				failedRecordsList.add(putRecordRequestEntry);
+        			}
+        		}
+    			putRecordsRequestEntryList = failedRecordsList;
+    			// If errors were found put back to kinesis
+    			if (putRecordsRequestEntryList.size()>0)
+    			{
+        		    putRecordsRequest.setRecords(putRecordsRequestEntryList);
+        		    result = kinesisClient.putRecords(putRecordsRequest);
+    			}
+    			else
+    			{
+    				// Clear the past results in case of no errors
+    				result = new PutRecordsResult();
+    			}
+        	}
+        	// Clear the entry list
+        	putRecordsRequestEntryList = new ArrayList<PutRecordsRequestEntry>(); 
+    	}
     }
 }

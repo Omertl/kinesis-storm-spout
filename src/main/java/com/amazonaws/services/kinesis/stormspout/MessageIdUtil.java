@@ -38,6 +38,10 @@ class MessageIdUtil {
     static String sequenceNumberOfMessageId(String messageId) {
         return messageId.split(":")[1];
     }
+    
+    static String inexOfMessageId (String messageId) {
+    	return messageId.split(":")[2];
+    }
 
     /**
      * Used to construct a messageId for a tuple corresponding to a Kinesis record.
@@ -48,6 +52,11 @@ class MessageIdUtil {
     static Object constructMessageId(String shardId, String sequenceNumber) {
         String messageId = shardId + ":" + sequenceNumber;
         return messageId;
+    }
+    
+    static String constructEventId(String shardId, String sequenceNumber, long index) {
+    	 String messageId = shardId + ":" + sequenceNumber + ":" + index;
+    	 return messageId;
     }
 
 }

@@ -37,7 +37,7 @@ public class KinesisSpoutConfig implements Serializable {
     private long topUpRecordListThreshold = 1000L;
     private int recordRetryLimit = 3;
     private Regions region = Regions.US_EAST_1;
-
+    private String delimiter = "\n";
     private final String zookeeperConnectionString;
     private String zookeeperPrefix = "kinesis_storm_spout";
     private int zookeeperSessionTimeoutMillis = 10000;
@@ -117,6 +117,22 @@ public class KinesisSpoutConfig implements Serializable {
     public KinesisSpoutConfig withKinesisRecordScheme(IKinesisRecordScheme scheme) {
         this.scheme = scheme;
         return this;
+    }
+    
+    /**
+     * @return delimiter used to split the Kinesis record.
+     */
+    public String getDelimiter() {
+    	return this.delimiter;
+    }
+    
+    /**
+     * @param delimiter used to split the Kinesis record.
+     * @return KinesisSpoutConfig
+     */
+    public KinesisSpoutConfig withDelimiter(String delimiter) {
+    	this.delimiter = delimiter;
+    	return this;
     }
 
     /**

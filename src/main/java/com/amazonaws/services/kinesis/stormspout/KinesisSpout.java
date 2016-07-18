@@ -52,13 +52,12 @@ public class KinesisSpout implements IRichSpout, Serializable {
     private final KinesisSpoutConfig config;
     private final IShardListGetter shardListGetter;
     private final IShardGetterBuilder getterBuilder;
-    private long emptyRecordListSleepTimeMillis = 5L;
+    
 
     // Initialized on open
     private transient SpoutOutputCollector collector;
     private transient TopologyContext context;
-    private transient IKinesisSpoutStateManager stateManager;
-    private transient long lastCommitTime;
+    private transient KinesisRecordtSplitter spoutSplitter;
 
     /**
      * Constructs an instance of the spout with just enough data to bootstrap the state from.
@@ -110,7 +109,7 @@ public class KinesisSpout implements IRichSpout, Serializable {
 
         this.context = spoutContext;
         this.collector = spoutCollector;
-        this.stateManager = new ZookeeperStateManager(config, shardListGetter, getterBuilder, initialPosition);
+        this.spoutSplitter = new KinesisRecordtSplitter(shardListGetter, getterBuilder, config, initialPosition);
         LOG.info(this + " open() called with topoConfig task index " + spoutContext.getThisTaskIndex()
                 + " for processing stream " + config.getStreamName());
     }
@@ -124,10 +123,7 @@ public class KinesisSpout implements IRichSpout, Serializable {
         LOG.debug(this + " activating. Starting to process stream " + config.getStreamName());
         final int taskIndex = context.getThisTaskIndex();
         final int totalNumTasks = context.getComponentTasks(context.getThisComponentId()).size();
-        stateManager.activate();
-        stateManager.rebalance(taskIndex, totalNumTasks);
-
-        lastCommitTime = System.currentTimeMillis();
+        spoutSplitter.Activate(taskIndex, totalNumTasks);
     }
 
     // A deactivated spout will not have nextTuple called on itself.
@@ -139,7 +135,7 @@ public class KinesisSpout implements IRichSpout, Serializable {
     public void deactivate() {
         LOG.debug(this + " deactivating.");
         try {
-            stateManager.deactivate();
+        	spoutSplitter.Deactivate();
         } catch (Exception e) {
             LOG.warn(this + " could not deactivate stateManager.", e);
         }
@@ -148,106 +144,35 @@ public class KinesisSpout implements IRichSpout, Serializable {
 
     @Override
     public void nextTuple() {
-        synchronized (stateManager) {
-            // Task has no assignments.
-            if (!stateManager.hasGetters()) {
-                // Sleep here for a bit, so we don't consume too much cpu.
-                try {
-                    Thread.sleep(emptyRecordListSleepTimeMillis);
-                } catch (InterruptedException e) {
-                    LOG.debug(this + " sleep was interrupted.");
-                }
-                return;
+    	Event curr = spoutSplitter.nextEvent();
+    	if (curr!=null)
+    	{
+    		LOG.debug("emitting cdr message " + curr.getMessageID());
+    		collector.emit(spoutSplitter.deserialize(curr), curr.getMessageID());
+    	}
+    	else
+    	{
+    		 // Sleep here for a bit if there were no records to emit.
+            try {
+            	LOG.debug(this + " sleeping since no records to emit");
+                Thread.sleep(spoutSplitter.getEmptyRecordListSleepTime());
+            } catch (InterruptedException e) {
+                LOG.debug(this + " sleep was interrupted.");
             }
-
-            final IShardGetter getter = stateManager.getNextGetter();
-            String currentShardId = getter.getAssociatedShard();
-            Record rec = null;
-            boolean isRetry = false;
-            
-            if (stateManager.shouldRetry(currentShardId)) {
-                rec = stateManager.recordToRetry(currentShardId);
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug("ShardId " + currentShardId + ": Re-emitting record with partition key " + rec.getPartitionKey() + ", sequence number "
-                            + rec.getSequenceNumber());
-                }
-                isRetry = true;
-            } else {
-                final ImmutableList<Record> records = getter.getNext(1).getRecords();
-                if ((records != null) && (!records.isEmpty())) {
-                    rec = records.get(0);
-                }
-            }
-
-            if (rec != null) {
-                // Copy record (ByteBuffer.duplicate()) so bolts in the same JVM don't affect the object (e.g. retries)
-                Record recordToEmit = copyRecord(rec);
-                List<Object> tuple = config.getScheme().deserialize(recordToEmit);
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug(this + " emitting record with seqnum " + recordToEmit.getSequenceNumber() + " from shard "
-                            + currentShardId + ".");
-                }
-
-                collector.emit(tuple, MessageIdUtil.constructMessageId(currentShardId, recordToEmit.getSequenceNumber()));
-                stateManager.emit(currentShardId, recordToEmit, isRetry);
-            } else {
-                // Sleep here for a bit if there were no records to emit.
-                try {
-                    Thread.sleep(emptyRecordListSleepTimeMillis);
-                } catch (InterruptedException e) {
-                    LOG.debug(this + " sleep was interrupted.");
-                }
-            }
-
-            // Do periodic ZK commit of shard states.
-            if (System.currentTimeMillis() - lastCommitTime >= config.getCheckpointIntervalMillis()) {
-                LOG.debug(this + " committing local shard states to ZooKeeper.");
-
-                stateManager.commitShardStates();
-                lastCommitTime = System.currentTimeMillis();
-            } else {
-                LOG.debug(this + " Not committing to ZooKeeper.");
-            }
-        }
+    	}
     }
 
-    /**
-     * Creates a copy of the record so we don't get interference from bolts that execute in the same JVM.
-     * We invoke ByteBuffer.duplicate() so the ByteBuffer state is decoupled.
-     * 
-     * @param record Kinesis record
-     * @return Copied record.
-     */
-    private Record copyRecord(Record record) {
-        Record duplicate = new Record();
-        duplicate.setPartitionKey(record.getPartitionKey());
-        duplicate.setSequenceNumber(record.getSequenceNumber());
-        duplicate.setData(record.getData().duplicate());
-        return duplicate;
-    }
 
     @Override
     public void ack(Object msgId) {
-        synchronized (stateManager) {
-            assert msgId instanceof String : "Expecting msgId_ to be a String";
-            final String seqNum = (String) MessageIdUtil.sequenceNumberOfMessageId((String) msgId);
-            final String shardId = MessageIdUtil.shardIdOfMessageId((String) msgId);
-            if (LOG.isDebugEnabled()) {
-                LOG.debug(this + " Processing ack() for " + msgId + ", shardId " + shardId + " seqNum " + seqNum);
-            }
-            stateManager.ack(shardId, seqNum);
-        }
+    	assert msgId instanceof String : "Expecting msgId_ to be a String";
+    	spoutSplitter.ack((String) msgId);
     }
 
     @Override
     public void fail(Object msgId) {
-        synchronized (stateManager) {
-            assert msgId instanceof String : "Expecting msgId_ to be a String";
-            final String seqNum = (String) MessageIdUtil.sequenceNumberOfMessageId((String) msgId);
-            final String shardId = MessageIdUtil.shardIdOfMessageId((String) msgId);
-            LOG.info(this + " Processing failed: " + shardId + ", seqNum " + seqNum);
-            stateManager.fail(shardId, seqNum);
-        }
+    	assert msgId instanceof String : "Expecting msgId_ to be a String";
+    	spoutSplitter.fail((String) msgId);
     }
 
     @Override
